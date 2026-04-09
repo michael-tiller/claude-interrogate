@@ -32,9 +32,9 @@ Install from the plugin marketplace inside Claude Code:
 /plugin install claude-interrogate
 ```
 
-Repository:
+Source Repository:
 
-- https://github.com/michael-tiller/claude-interrogate
+- https://github.com/michael-tiller/claude-interrogate-src
 
 Notes:
 
