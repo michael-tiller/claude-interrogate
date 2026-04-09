@@ -1,0 +1,17 @@
+{
+  "name": "claude-interrogate",
+  "version": "0.1.1",
+  "description": "Installable Claude Code plugin for Claude Interrogate, an adversarial design-doc skillset.",
+  "author": {
+    "name": "Michael Tiller"
+  },
+  "repository": "https://github.com/michael-tiller/claude-interrogate",
+  "license": "MIT",
+  "keywords": [
+    "design-docs",
+    "claude-code",
+    "mcp",
+    "architecture",
+    "interview"
+  ]
+}

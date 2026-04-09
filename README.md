@@ -5,9 +5,9 @@ This directory is the distribution payload for the installable Claude Code plugi
 
 Contents:
 
-- `plugins/claude-interrogate/` installable plugin payload
+- `.claude-plugin/marketplace.json` Claude Code marketplace metadata
+- `plugin/` installable plugin payload
 - `runtime/dist/` built MCP server runtime
-- `marketplace.json` Claude Code marketplace metadata
 
 Current command surface:
 

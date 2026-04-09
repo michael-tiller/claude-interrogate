@@ -3,7 +3,7 @@
     "claude-interrogate": {
       "command": "node",
       "args": [
-        "../../runtime/dist/server.js"
+        "../runtime/dist/server.js"
       ]
     }
   }
