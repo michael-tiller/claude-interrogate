@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "claude-interrogate": {
+      "command": "node",
+      "args": [
+        "../../runtime/dist/server.js"
+      ]
+    }
+  }
+}
