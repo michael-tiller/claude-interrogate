@@ -7,7 +7,7 @@ Contents:
 
 - `plugins/claude-interrogate/` installable plugin payload
 - `runtime/dist/` built MCP server runtime
-- `.agents/plugins/marketplace.json` marketplace metadata
+- `marketplace.json` Claude Code marketplace metadata
 
 Current command surface:
 
