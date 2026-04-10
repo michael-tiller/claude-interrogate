@@ -8,6 +8,7 @@ Contents:
 - `.claude-plugin/marketplace.json` Claude Code marketplace metadata
 - `.mcp.json` Codex/Claude-compatible MCP attachment config for the runtime repo
 - `plugin/` installable Claude Code plugin payload
+- `plugin/runtime/dist/` self-contained MCP runtime used by the installed plugin
 - `runtime/dist/` built MCP server runtime
 
 Current command surface:

@@ -3,7 +3,7 @@
     "claude-interrogate": {
       "command": "node",
       "args": [
-        "../runtime/dist/server.js"
+        "${CLAUDE_PLUGIN_ROOT}/runtime/dist/server.js"
       ]
     }
   }
