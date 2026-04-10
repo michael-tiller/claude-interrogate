@@ -1,6 +1,6 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { DEFAULT_DOC_VERSION, detectHouseStyle, ensureDocumentMetadata, loadDocFile, loadDocs } from "./docs.js";
+import { DEFAULT_DOC_VERSION, detectHouseStyle, loadDocFile, loadDocs, postEditNormalizeDocument } from "./docs.js";
 import { renderDefaultGoldenTemplate } from "./default-template.js";
 const TODAY = "2026-04-08";
 export async function designDocGenerate(input, outputPath) {
@@ -20,12 +20,16 @@ export async function designDocGenerate(input, outputPath) {
         title: doc.title,
         relativePath: toPosixRelative(path.dirname(resolvedOutputPath), doc.path)
     })));
+    const normalized = postEditNormalizeDocument(undefined, content, TODAY, {
+        crossRefHeading: style.crossRefHeading,
+        openQuestionsHeading: style.openQuestionsHeading
+    });
     await mkdir(path.dirname(outputPath), { recursive: true });
-    await writeFile(outputPath, ensureDocumentMetadata(content, TODAY, DEFAULT_DOC_VERSION), "utf8");
-    await syncSiblingCrossReferences(resolvedOutputPath, input.concept, siblingDocs, style.crossRefHeading);
+    await writeFile(outputPath, normalized.content, "utf8");
+    await syncSiblingCrossReferences(resolvedOutputPath, input.concept, siblingDocs, style.crossRefHeading, style.openQuestionsHeading);
     return {
         outputPath: resolvedOutputPath,
-        content: ensureDocumentMetadata(content, TODAY, DEFAULT_DOC_VERSION)
+        content: normalized.content
     };
 }
 function renderDoc(concept, responses, style, siblingLinks) {
@@ -76,7 +80,7 @@ function renderDoc(concept, responses, style, siblingLinks) {
         : "- None.", "", "## Version History", "", `- ${DEFAULT_DOC_VERSION} (${TODAY}): Initial documented draft.`);
     return sections.join("\n");
 }
-async function syncSiblingCrossReferences(outputPath, concept, siblingDocs, crossRefHeading) {
+async function syncSiblingCrossReferences(outputPath, concept, siblingDocs, crossRefHeading, openQuestionsHeading) {
     const newDocTitle = toTitle(concept);
     await Promise.all(siblingDocs.map(async (doc) => {
         const relativePath = toPosixRelative(path.dirname(doc.path), outputPath);
@@ -86,7 +90,11 @@ async function syncSiblingCrossReferences(outputPath, concept, siblingDocs, cros
             return;
         }
         const updated = upsertCrossReference(content, crossRefHeading, linkLine);
-        await writeFile(doc.path, updated, "utf8");
+        const normalized = postEditNormalizeDocument(content, updated, TODAY, {
+            crossRefHeading,
+            openQuestionsHeading
+        });
+        await writeFile(doc.path, normalized.content, "utf8");
     }));
 }
 function upsertCrossReference(content, crossRefHeading, linkLine) {

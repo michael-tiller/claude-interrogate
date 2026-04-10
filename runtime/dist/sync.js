@@ -1,6 +1,6 @@
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
-import { DEFAULT_DOC_VERSION, detectHouseStyle, ensureDocumentMetadata, extractBullets, extractOpenQuestions, getSectionBody, listSections, loadDocFile, loadDocs, moveSectionBefore, removeSection, replaceOrAppendSection } from "./docs.js";
+import { detectHouseStyle, extractBullets, extractOpenQuestions, getSectionBody, listSections, loadDocFile, loadDocs, moveSectionBefore, postEditNormalizeDocument, removeSection, replaceOrAppendSection } from "./docs.js";
 import { renderDefaultGoldenTemplate } from "./default-template.js";
 const TODAY = "2026-04-08";
 const STOP_WORDS = new Set([
@@ -92,7 +92,10 @@ export async function designCrossRefSync(docsDir, styleTemplatePath) {
             ? unresolvedQuestions.map((question) => `- ${question}`).join("\n")
             : "- None.");
         nextContent = moveSectionBefore(nextContent, "Resolved Decisions", style.openQuestionsHeading);
-        nextContent = ensureDocumentMetadata(nextContent, TODAY, DEFAULT_DOC_VERSION);
+        nextContent = postEditNormalizeDocument(doc.content, nextContent, TODAY, {
+            crossRefHeading: style.crossRefHeading,
+            openQuestionsHeading: style.openQuestionsHeading
+        }).content;
         if (nextContent !== doc.content) {
             await writeFile(doc.path, nextContent, "utf8");
             updatedFiles.push(doc.path);

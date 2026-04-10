@@ -1,12 +1,13 @@
 # Claude Interrogate Runtime
 Updated: 2026-04-08
 
-This directory is the distribution payload for the installable Claude Code plugin.
+This directory is the distribution payload for the installable Claude Code plugin and the Codex MCP runtime.
 
 Contents:
 
 - `.claude-plugin/marketplace.json` Claude Code marketplace metadata
-- `plugin/` installable plugin payload
+- `.mcp.json` Codex/Claude-compatible MCP attachment config for the runtime repo
+- `plugin/` installable Claude Code plugin payload
 - `runtime/dist/` built MCP server runtime
 
 Current command surface:
@@ -32,9 +33,22 @@ Install from the plugin marketplace inside Claude Code:
 /plugin install claude-interrogate
 ```
 
-Source Repository:
+In Codex, attach the runtime repo's checked-in `.mcp.json`, which runs:
 
-- https://github.com/michael-tiller/claude-interrogate-src
+```json
+{
+  "mcpServers": {
+    "claude-interrogate": {
+      "command": "node",
+      "args": ["./runtime/dist/server.js"]
+    }
+  }
+}
+```
+
+Repository:
+
+- https://github.com/michael-tiller/claude-interrogate
 
 Notes:
 

@@ -1,6 +1,9 @@
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 export const DEFAULT_DOC_VERSION = "0.1.0";
+const DEFAULT_PATCH_PLACEHOLDER = "- None.";
+const DEFAULT_RESOLVED_PLACEHOLDER = "- No resolved decisions captured yet.";
+const VERSION_HISTORY_HEADING = "Version History";
 const DEFAULT_STYLE = {
     sectionNumbering: "## 1.",
     crossRefHeading: "Cross-References",
@@ -189,6 +192,29 @@ export function ensureVersionLine(content, version) {
 export function ensureDocumentMetadata(content, isoDate, version) {
     return ensureVersionLine(ensureUpdatedDate(ensureCreatedDate(content, isoDate), isoDate), version);
 }
+export function postEditNormalizeDocument(previousContent, nextContent, isoDate, options) {
+    const previousVersion = previousContent ? extractVersion(previousContent) : null;
+    const bump = previousContent
+        ? inferSemverBump(previousContent, nextContent, options)
+        : "none";
+    const version = previousVersion
+        ? bumpSemver(previousVersion, bump)
+        : DEFAULT_DOC_VERSION;
+    let content = ensureDocumentMetadata(nextContent, isoDate, version);
+    if (options?.crossRefHeading) {
+        const existing = getSectionBody(content, options.crossRefHeading);
+        content = replaceOrAppendSection(content, options.crossRefHeading, existing?.trim() ? existing.trim() : DEFAULT_PATCH_PLACEHOLDER);
+    }
+    const resolvedBody = getSectionBody(content, "Resolved Decisions");
+    content = replaceOrAppendSection(content, "Resolved Decisions", resolvedBody?.trim() ? resolvedBody.trim() : DEFAULT_RESOLVED_PLACEHOLDER);
+    if (options?.openQuestionsHeading) {
+        const existing = getSectionBody(content, options.openQuestionsHeading);
+        content = replaceOrAppendSection(content, options.openQuestionsHeading, existing?.trim() ? existing.trim() : DEFAULT_PATCH_PLACEHOLDER);
+        content = moveSectionBefore(content, "Resolved Decisions", options.openQuestionsHeading);
+    }
+    content = ensureVersionHistoryEntry(content, version, isoDate, bump, previousContent ? "update" : "initial");
+    return { content, version, bump };
+}
 export function moveSectionBefore(content, heading, beforeHeading) {
     const lines = content.split(/\r?\n/);
     const startIndex = lines.findIndex((line) => normalizeHeading(line).toLowerCase() === heading.toLowerCase());
@@ -267,4 +293,124 @@ function inferToneCues(docs) {
         toneCues.push("normative");
     }
     return toneCues;
+}
+function extractVersion(content) {
+    return content.match(/^Version:\s+(\d+\.\d+\.\d+)$/m)?.[1] ?? null;
+}
+function bumpSemver(version, bump) {
+    const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/);
+    if (!match) {
+        return DEFAULT_DOC_VERSION;
+    }
+    const major = Number(match[1]);
+    const minor = Number(match[2]);
+    const patch = Number(match[3]);
+    switch (bump) {
+        case "major":
+            return `${major + 1}.0.0`;
+        case "minor":
+            return `${major}.${minor + 1}.0`;
+        case "patch":
+            return `${major}.${minor}.${patch + 1}`;
+        case "none":
+        default:
+            return version;
+    }
+}
+function inferSemverBump(previousContent, nextContent, options) {
+    const previousTitle = extractTitle("<unknown>", previousContent);
+    const nextTitle = extractTitle("<unknown>", nextContent);
+    if (previousTitle !== nextTitle) {
+        return "major";
+    }
+    const managedHeadings = new Set([
+        options?.crossRefHeading,
+        options?.openQuestionsHeading,
+        "Resolved Decisions",
+        VERSION_HISTORY_HEADING
+    ].filter((value) => Boolean(value)).map((value) => canonicalSectionHeading(value)));
+    const previousSections = comparableSections(previousContent);
+    const nextSections = comparableSections(nextContent);
+    const changedCoreSections = new Set();
+    const changedManagedSections = new Set();
+    const allHeadings = new Set([...previousSections.keys(), ...nextSections.keys()]);
+    for (const heading of allHeadings) {
+        const previousBody = previousSections.get(heading) ?? null;
+        const nextBody = nextSections.get(heading) ?? null;
+        if (previousBody === nextBody) {
+            continue;
+        }
+        if (managedHeadings.has(heading)) {
+            changedManagedSections.add(heading);
+            continue;
+        }
+        changedCoreSections.add(heading);
+    }
+    if (changedCoreSections.size === 0 && changedManagedSections.size === 0) {
+        return "none";
+    }
+    const previousCoreHeadings = new Set(Array.from(previousSections.keys()).filter((heading) => !managedHeadings.has(heading)));
+    const nextCoreHeadings = new Set(Array.from(nextSections.keys()).filter((heading) => !managedHeadings.has(heading)));
+    const removedCoreHeading = Array.from(previousCoreHeadings).some((heading) => !nextCoreHeadings.has(heading));
+    const addedCoreHeading = Array.from(nextCoreHeadings).some((heading) => !previousCoreHeadings.has(heading));
+    if (removedCoreHeading ||
+        changedCoreSections.size >= 3 ||
+        (changedCoreSections.has("decision") && changedCoreSections.has("chosen shape"))) {
+        return "major";
+    }
+    if (changedCoreSections.size > 0 || addedCoreHeading) {
+        return "minor";
+    }
+    return "patch";
+}
+function comparableSections(content) {
+    return new Map(listSections(stripMetadataLines(content)).map((section) => [
+        canonicalSectionHeading(section.heading),
+        normalizeComparableText(section.body)
+    ]));
+}
+function canonicalSectionHeading(value) {
+    return normalizeHeading(value)
+        .replace(/^(?:\d+(?:\.\d+)*[.)]?\s+)+/, "")
+        .toLowerCase();
+}
+function stripMetadataLines(content) {
+    return content
+        .split(/\r?\n/)
+        .filter((line) => !/^Created:\s+\d{4}-\d{2}-\d{2}$/.test(line) &&
+        !/^Updated:\s+\d{4}-\d{2}-\d{2}$/.test(line) &&
+        !/^Version:\s+\d+\.\d+\.\d+$/.test(line))
+        .join("\n");
+}
+function normalizeComparableText(value) {
+    return value.replace(/\s+/g, " ").trim();
+}
+function ensureVersionHistoryEntry(content, version, isoDate, bump, mode) {
+    const summary = versionHistorySummary(bump, mode);
+    const entry = `- ${version} (${isoDate}): ${summary}`;
+    const existingBody = getSectionBody(content, VERSION_HISTORY_HEADING);
+    const lines = existingBody
+        ? existingBody
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .filter((line) => !line.startsWith(`- ${version} (`))
+        : [];
+    return replaceOrAppendSection(content, VERSION_HISTORY_HEADING, [entry, ...lines].join("\n"));
+}
+function versionHistorySummary(bump, mode) {
+    if (mode === "initial") {
+        return "Initial documented draft.";
+    }
+    switch (bump) {
+        case "major":
+            return "Major design revision or contract shift.";
+        case "minor":
+            return "Substantive design update.";
+        case "patch":
+            return "Metadata, linkage, or narrow doc maintenance update.";
+        case "none":
+        default:
+            return "No substantive content change.";
+    }
 }

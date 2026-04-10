@@ -15,5 +15,13 @@ export declare function ensureUpdatedDate(content: string, isoDate: string): str
 export declare function ensureCreatedDate(content: string, isoDate: string): string;
 export declare function ensureVersionLine(content: string, version: string): string;
 export declare function ensureDocumentMetadata(content: string, isoDate: string, version: string): string;
+export declare function postEditNormalizeDocument(previousContent: string | undefined, nextContent: string, isoDate: string, options?: {
+    crossRefHeading?: string;
+    openQuestionsHeading?: string;
+}): {
+    content: string;
+    version: string;
+    bump: "major" | "minor" | "patch" | "none";
+};
 export declare function moveSectionBefore(content: string, heading: string, beforeHeading: string): string;
 export declare function removeSection(content: string, heading: string): string;
