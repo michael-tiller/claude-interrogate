@@ -26,6 +26,9 @@ Current command surface:
 - `/claude-interrogate:summarize <concept> [docs-dir]`
 - `/claude-interrogate:audit-docs [docs-dir]`
 - `/claude-interrogate:sync-docs [docs-dir]`
+- `/claude-interrogate:adr [title]`
+- `/claude-interrogate:roadmap [docs-dir]`
+- `/claude-interrogate:taskout <rc-id> [docs-dir]`
 
 Install from the plugin marketplace inside Claude Code:
 
@@ -46,6 +49,15 @@ In Codex, attach the runtime repo's checked-in `.mcp.json`, which runs:
   }
 }
 ```
+
+Codex workflows are exposed as skills (not new top-level slash commands). Run `/skills` (or type `$`) and select:
+
+- `claude-interrogate-interrogate`
+- `claude-interrogate-audit-docs`
+- `claude-interrogate-sync-docs`
+- `claude-interrogate-adr`
+- `claude-interrogate-roadmap`
+- `claude-interrogate-taskout`
 
 Repository:
 
