@@ -1,6 +1,6 @@
 {
   "name": "claude-interrogate",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Installable Claude Code plugin for Claude Interrogate, an adversarial design-doc skillset.",
   "author": {
     "name": "Michael Tiller"
