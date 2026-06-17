@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "claude-interrogate",
-      "version": "0.1.15",
+      "version": "0.1.16",
       "source": "./plugin",
       "description": "Adversarial design-doc skillset for interrogating, auditing, and syncing design docs."
     }
