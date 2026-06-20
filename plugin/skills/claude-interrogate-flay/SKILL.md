@@ -38,6 +38,25 @@ Create `.captain-sdlc/` lazily; ensure the consuming project gitignores
 `flay-state.json` (it is churning local state — see captain-sdlc conventions).
 Unknown `schema_version` in an existing file → refuse and ask the human.
 
+## Ledger: `.captain-sdlc/blocked-hitl.json`
+
+Flay-owned, also churning local state — gitignore it alongside `flay-state.json`.
+It records keys an auto run downgraded to HITL, keyed by task key (entries are
+created lazily on the first downgrade). Lifecycle:
+
+- **Append** on the auto→HITL downgrade at Verifying (phase 4).
+- **Clear the entry** at Done (phase 6), when the HITL resume completes and the
+  state file is deleted.
+- **Auto-clean** when the item flips to `[x]` (the work is done — the marker is moot;
+  the sync side that observes the checkbox flip drops the entry, same trigger that
+  retires the `blocked-hitl` tag).
+- **Manual reset:** to clear a stranded marker by hand, delete its entry from the
+  JSON (or delete the whole file to reset all). Use this if a downgrade was logged
+  but the flay was abandoned outside the Done path.
+
+The Blocked-detector at Assigned reads this ledger to cancel `/flay-auto` (and let
+`/flay` proceed) on a downgraded key.
+
 ## Phases
 
 `assigned → planning → plan-approved → implementing → verifying → committing → done`
@@ -49,8 +68,39 @@ Unknown `schema_version` in an existing file → refuse and ask the human.
 1. **Assigned.** Validate the key against a fresh `design_taskout_export` for its
    RC (key prefix before the first `#`). Exact match only. Unknown key → stop,
    show the export's nearby keys, let the human re-pick — never fuzzy-assign.
-   Already-checked item → stop and say so (the work appears done). Write the state
-   file, then classify the item for taste (see **Taste gate**) before planning.
+   Already-checked item → stop and say so (the work appears done). Then run the
+   **Blocked-detector** (below); if it cancels, abort here — do NOT write the state
+   file. Otherwise write the state file, then classify the item for taste (see
+   **Taste gate**) before planning.
+
+   **Blocked-detector (pre-flight, READ-ONLY).** Before committing to the work,
+   confirm it is actually runnable. This reads only — the fresh `design_taskout_export`
+   plus the `.captain-sdlc/blocked-hitl.json` ledger — and never writes the roadmap,
+   the tracker, or anything but its own cancel decision (Principle 1; see Hard rules).
+   Locate the assigned item in the export and check, in order:
+   - **`blocked-dep`** — the item carries a `blockedBy` list. For each listed blocker
+     key, find it in the same export and read its `checked` flag. If ANY blocker has
+     `checked === false`, the work is not runnable yet → **cancel in BOTH modes**:
+     `Blocked by <key> "<text>" — owned by <owner | "unassigned">. Resolve it / talk
+     to <owner> first.` (`<text>` is the blocker item's text; `<owner>` is the
+     blocker's `owner`, else the assigned item's, else `"unassigned"`).
+   - **Stale blocker reference** — a `blockedBy` key that is ABSENT from this (clean)
+     export. Ticket keys are now immutable (they persist inline and survive reweords),
+     so absence means the blocker ticket was DELETED or the anchor is a typo/wrong key —
+     a dangling reference, NOT an unblock. **Cancel** with a stale-reference repair
+     message — name the missing key and say the blocker was likely removed or mistyped;
+     the human or `/taskout`-maintenance must repair the `- Blocked-by:` anchor. Never
+     report it as "unblocked" and never proceed.
+   - **`blocked-hitl`** — the item's key has a live entry in
+     `.captain-sdlc/blocked-hitl.json` (a downgrade marker from a prior auto run).
+     **Cancel in auto** (`/flay-auto`): auto must not resume work an earlier auto run
+     punted to a human — `This task was downgraded to HITL on a prior run; resume it
+     with /flay.` **Proceed in HITL** (`/flay`): the human IS resuming, which is
+     exactly what the marker waits for.
+
+   Cancel = abort the Assigned phase before any `flay-state.json` is created; report
+   the reason and stop. The detector adds no machinery: it surfaces the blocker, the
+   human (or `/taskout`) resolves it in the markdown.
 2. **Planning.** Enter Claude Code plan mode for the implementation design. First
    read the assigned item's spec from the export. **Warm vs cold:**
    - *Warm* — the item carries `howToImplement` / `designContext` (taskout already
@@ -67,30 +117,59 @@ Unknown `schema_version` in an existing file → refuse and ask the human.
      drafted plan. It ships in this plugin, so it is always present alongside this
      skill. It returns a structured critique ending in exactly one line:
      `VERDICT: NEEDS REVISION` or `VERDICT: IMPLEMENTATION READY`.
-   - *Critic 2 — codex third opinion (best-effort).* If `codex` is on PATH, get an
-     out-of-model second pair of eyes — read-only so it critiques but never edits:
-     `codex exec -s read-only "<brief>\n\n<the full plan text>"`, where `<brief>` is
+   - *Critic 2 — codex out-of-model gate (best-effort).* Runs only after Critic 1 is
+     satisfied. If `codex` is on PATH, get an out-of-model second pair of eyes —
+     read-only so it critiques but never edits.
+     Append its output to the same artifact instead of dumping stdout into context:
+     `codex exec -s read-only "<brief>\n\n<the full plan text>" >> .captain-sdlc/plan-review.txt 2>&1`,
+     then read codex's verdict back from that file. `<brief>` is
      "Act as a ruthless principal-engineer plan reviewer; do not write code. Ground
      every load-bearing claim in the actual repo (an empty grep is not proof of
-     absence). Hunt for gaps, speculative abstraction, conflicts with existing
-     conventions, unverified assumptions, scope creep, and tests that cannot fail
-     when the logic changes. List blocking issues (each with location, why it
-     matters, and a concrete fix), then end with exactly one line: VERDICT: NEEDS
-     REVISION or VERDICT: IMPLEMENTATION READY." codex missing or erroring → note
+     absence) — you may read `.captain-sdlc/plan-review-grounding.txt` for facts the
+     first critic already verified, to skip re-grepping them. Hunt for gaps,
+     speculative abstraction, conflicts with existing conventions, unverified
+     assumptions, scope creep, and tests that cannot fail when the logic changes.
+     List blocking issues (each with location, why it matters, and a concrete fix),
+     then end with exactly one line: VERDICT: NEEDS REVISION or VERDICT:
+     IMPLEMENTATION READY." codex missing or erroring → note
      "codex unavailable — skipped" and proceed on Critic 1 alone. Never block the
      gate on codex.
 
    Address every blocking issue — revise the plan, or record why it does not apply.
-   The gate clears only when BOTH critics return `IMPLEMENTATION READY` on the *same*
-   final plan. A READY verdict covers only the exact plan text the critic saw: any
-   later edit invalidates it, so folding in codex's feedback yields a new revision
-   that Claude must re-validate (and a Claude-driven revision must go back to codex).
-   Re-run both critics on each revision until one plan survives both with no edits
-   after the last verdict. HITL: show both verdicts and their blocking lists each
-   round; loop until both read READY on the same revision, or the human waives what
-   remains. Auto: at most TWO review→revise rounds, then go to approval carrying any
-   unresolved blocking issue forward as an explicit caveat — never infinite-loop,
-   never silently drop one.
+   **Run one critic at a time** so you never spend a critic's call on a plan the other
+   would still reject. Alternate:
+   1. **Claude until READY.** Run Critic 1 on the current plan, revise against its
+      blocking issues, re-run Critic 1. Loop until it returns `IMPLEMENTATION READY`
+      on a revision you did not edit afterward.
+   2. **Then codex on that exact revision.** Run Critic 2 with no edits in between. If
+      it returns READY too, both critics have approved the *same* unedited plan →
+      **gate clears**.
+   3. **Any codex fix sends it back to Claude.** A READY verdict covers only the exact
+      plan text the critic saw, so folding codex's blocking issues in yields a new
+      revision that invalidates Claude's READY — return to step 1 and re-validate it
+      with Claude before codex sees it again.
+
+   There is no round limit: each revision is a real improvement, so recurse until one
+   revision survives both critics back-to-back with no edits after either verdict.
+   Never silently drop a blocking issue. HITL: show each verdict and its blocking list
+   as it lands; the human may waive what remains to clear early. Auto: keep cycling —
+   but if the two critics deadlock (each rejecting the change the other required), the
+   tool can't resolve that conflict alone → announce it and downgrade to HITL rather
+   than oscillate forever. If codex is unavailable, step 1's Claude READY clears the
+   gate on its own.
+
+   Read each critic's verdict from the artifact, not its raw return. Whichever critic
+   ran writes its review to `.captain-sdlc/plan-review.txt` — Critic 1 overwrites it
+   each round; codex appends its section when its turn comes. Read THAT file for the
+   current critic's verdict and blocking list; it is the single read target, rewritten
+   fresh as the alternation proceeds, so re-reviews don't re-scan verbose prose.
+   Critic 1 also keeps a longer-lived grounding cache at
+   `.captain-sdlc/plan-review-grounding.txt` where it records verified repo facts and
+   reads them back across rounds (codex may consult it), so they don't re-grep the same
+   facts. When this review phase ends — the gate clears, the human waives, or auto
+   downgrades on a deadlock — DELETE both files, so the next task's review phase starts
+   fresh. (Churning local state like the rest of `.captain-sdlc/`; gitignore them
+   alongside `flay-state.json`.)
 
    Plan approval (ExitPlanMode) is a harness gate in BOTH modes. On approval →
    record `plan-approved`.
@@ -101,7 +180,13 @@ Unknown `schema_version` in an existing file → refuse and ask the human.
    exists, say so and let the human decide what verification means here.
    - HITL: failures → show output, human decides next step.
    - Auto: ANY verify failure → announce "downgrading to HITL" and switch modes
-     permanently for this flay. Never retry-loop.
+     permanently for this flay. Never retry-loop. On the downgrade, record it in TWO
+     places: (a) write `downgradedAt` (ISO) and `downgradedPhase` (`"verifying"`) to
+     `flay-state.json`; (b) append the task key to `.captain-sdlc/blocked-hitl.json`
+     (create the file lazily as a JSON array/object keyed by task key — match the
+     ledger shape the Blocked-detector reads). This `blocked-hitl` marker makes a
+     later `/flay-auto` on the same key cancel (it must not silently re-attempt the
+     punted work), while `/flay` (human resuming) proceeds past it.
 5. **Committing.** Stage the work, then follow the task-footers flow
    (claude-release-clickup) if installed — it will default to this key from the
    state file; otherwise compose the footer per Seam 7 directly. Before the footer
@@ -112,8 +197,11 @@ Unknown `schema_version` in an existing file → refuse and ask the human.
    - Auto: default `Needs-QA:` (unwatched work is exactly what QA exists for);
      only use `Completes:` if the human pre-authorized it when invoking.
    Use `Implements:` instead when the commit advances but does not finish the item.
-6. **Done.** Delete the state file, prepend the scratch.md outcome line, report:
-   key, phases walked, verify result, commit hash, footer verb. If the item was
+6. **Done.** Delete the state file AND clear this key's entry from
+   `.captain-sdlc/blocked-hitl.json` if present (the HITL resume completed, so the
+   downgrade marker has served its purpose — leaving it would wrongly cancel a future
+   `/flay-auto` on the same key). Prepend the scratch.md outcome line, report: key,
+   phases walked, verify result, commit hash, footer verb. If the item was
    taste-laden and vibe-shipped, also append its finalize-UI follow-up to
    `.captain-sdlc/taste-debt.md` (see **Taste gate**).
 
@@ -166,7 +254,10 @@ here, never a reason to skip the trail.
 - Keys come only from `design_taskout_export` — never derived, never guessed.
 - Warm tickets (export carries `howToImplement` / `designContext`) carry their spec
   forward at Planning; re-derive from scratch only for cold tickets.
-- Flay never picks work, never reorders the roadmap, never rewords a task.
+- Flay never picks work, never reorders the roadmap, never rewords a task. The
+  Blocked-detector is READ-ONLY too: it reads the export + `blocked-hitl.json` ledger
+  and may only cancel; it never writes the roadmap or a tracker. A surfaced blocker /
+  stale reference is repaired by the human or `/taskout`, not by flay.
 - No git hooks; everything is in-session orchestration.
 - Downstream blades read the state file advisorily; flay never calls a tracker.
 - Taste-laden items (art/UX/UI) trip the **taste gate**: auto must push for
