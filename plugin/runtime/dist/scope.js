@@ -493,7 +493,35 @@ function renderRCStub(rc, today, plan, existing) {
         for (const sub of existing.targeted) {
             lines.push(`### ${sub.heading}`);
             for (const item of sub.items) {
-                lines.push(`- [${item.checked ? "x" : " "}] ${item.text}`);
+                // Echo the persisted immutable key comment so a scope-maintenance rewrite never strips a
+                // ticket's identity (this stub only preserves keys — taskout mints them). See
+                // seam-task-identity.md.
+                const keyComment = item.key ? `  <!-- key: ${item.key} -->` : "";
+                lines.push(`- [${item.checked ? "x" : " "}] ${item.text}${keyComment}`);
+                // Render the FULL per-ticket sub-bullet set, matching renderTaskout — the RC
+                // stub previously dropped every sub-bullet, silently losing AC/How/Why and
+                // any blocked-by/owner on a maintenance scope rewrite.
+                if (item.dod && item.dod.length > 0) {
+                    for (const criterion of item.dod) {
+                        lines.push(`  - AC: ${criterion}`);
+                    }
+                }
+                if (item.howToImplement && item.howToImplement.length > 0) {
+                    for (const step of item.howToImplement) {
+                        lines.push(`  - How: ${step}`);
+                    }
+                }
+                if (item.designContext && item.designContext.length > 0) {
+                    for (const note of item.designContext) {
+                        lines.push(`  - Why: ${note}`);
+                    }
+                }
+                if (item.blockedBy && item.blockedBy.length > 0) {
+                    lines.push(`  - Blocked-by: ${item.blockedBy.join(", ")}`);
+                }
+                if (item.owner) {
+                    lines.push(`  - Owner: ${item.owner}`);
+                }
             }
             lines.push("");
         }

@@ -97,8 +97,30 @@ export async function generateTaskout(input) {
     if (input.mode === "bootstrap-rc" && rcFileExists) {
         throw new TaskoutError("mode-mismatch", `Caller said mode='bootstrap-rc' but ${rcAbs} already exists. Use mode='maintenance' instead.`);
     }
-    if (input.mode === "maintenance") {
-        await enforceShippedTaskoutLock(rcAbs, plan);
+    // Maintenance rebuilds the file from a (keyless) LLM plan, so re-attach each ticket's PERSISTED
+    // key BEFORE anything keys the list — keeps identity immutable across reweords, and lets the
+    // order gate resolve `- Blocked-by:` tokens (which the human writes against persisted keys).
+    const existing = input.mode === "maintenance" ? await parseRCFile(rcAbs) : null;
+    if (existing) {
+        carryForwardKeys(existing.targeted, plan.targeted);
+        await enforceShippedTaskoutLock(existing, plan);
+    }
+    // Write-path order gate (UNCONDITIONAL — bootstrap-rc is the first-author path that most needs it).
+    // The Targeted list order IS the pushed (ClickUp) order, so refuse to write a plan whose declared
+    // `- Blocked-by:` edges contradict that order, or that point at a ticket key absent from this RC
+    // (a typo / bare digest / stale ref). Fires at authoring — the author fixes it before it lands.
+    // Cross-RC upstream deps are ignored; stray prose ordering sections are advisory-only (export
+    // surfaces them) and never block a write. Read-path (exportTaskout) stays clean for flay/sync.
+    const order = analyzeTaskoutOrder(keyedTargeted(plan.targeted, plan.rc.id), plan.rc.id);
+    if (order.blockedByViolations.length > 0 ||
+        order.unresolvedBlockedBy.length > 0 ||
+        order.phaseSequenceViolations.length > 0) {
+        const parts = [
+            ...order.blockedByViolations.map((v) => `'${v.item}' is Blocked-by '${v.blocker}', which is listed at or after it — order the Targeted list so blockers come first`),
+            ...order.unresolvedBlockedBy.map((u) => `'${u.item}' is Blocked-by '${u.token}', which resolves to no ticket in ${plan.rc.id} — use the full ticket key '<RCID>#<epic-slug>#<digest>'`),
+            ...order.phaseSequenceViolations.map((p) => `epic '${p.heading}' ${p.detail}`),
+        ];
+        throw new TaskoutError("order-violation", `Targeted order is inconsistent (the list order is the ClickUp order):\n- ${parts.join("\n- ")}`);
     }
     const today = formatIsoDate((input.clock ?? (() => new Date()))());
     const target = input.mode === "maintenance" ? withDraftSuffix(rcAbs) : rcAbs;
@@ -138,6 +160,162 @@ function normalizeTaskoutPlan(plan) {
     }
     return plan;
 }
+/**
+ * Compute the stable export keys (epic + per-ticket) for a Targeted section list. Extracted so the
+ * read path ({@link exportTaskout}) and the write-path order gate (`generateTaskout`) derive
+ * byte-identical keys.
+ *
+ * Identity is PERSISTED, not re-derived: an item that carries `item.key` (read back from its inline
+ * `<!-- key: … -->` comment, or echoed by the maintenance plan) keeps that key verbatim — so
+ * rewording the ticket text or its epic heading does NOT mint a new key (see seam-task-identity.md).
+ * Only a brand-new keyless item is minted, by the original algorithm (hash of TEXT + encounter
+ * occurrence; sub-bullets never hashed) — so legacy keyless files reproduce today's exact keys, then
+ * freeze on the next write. The epic key is taken from the section's first already-keyed item (so it
+ * stays coherent with its items across a heading rename) and only falls back to the heading slug for
+ * a wholly new epic.
+ */
+export function keyedTargeted(targeted, rcId) {
+    const slugCounts = new Map();
+    return targeted.map((sub) => {
+        const established = sub.items.find((it) => it.key && it.key.includes("#"))?.key;
+        let epicKey;
+        if (established) {
+            epicKey = established.slice(0, established.lastIndexOf("#"));
+        }
+        else {
+            const baseSlug = slugifyHeading(sub.heading);
+            const priorUses = slugCounts.get(baseSlug) ?? 0;
+            slugCounts.set(baseSlug, priorUses + 1);
+            epicKey =
+                priorUses === 0 ? `${rcId}#${baseSlug}` : `${rcId}#${baseSlug}-${priorUses + 1}`;
+        }
+        // Occurrence counts EVERY item (kept or new) so a freshly minted duplicate can't collide
+        // with a kept ticket that already owns the occurrence-0 digest.
+        const textOccurrences = new Map();
+        const items = sub.items.map((item) => {
+            const normalized = normalizeItemText(item.text);
+            const occurrence = textOccurrences.get(normalized) ?? 0;
+            textOccurrences.set(normalized, occurrence + 1);
+            // NUL delimiter prevents concatenation-shape collisions between text and occurrence.
+            const digest = createHash("sha1")
+                .update(`${normalized}\0${occurrence}`)
+                .digest("hex")
+                .slice(0, 12);
+            // Persisted key wins; mint only when this ticket has never been keyed.
+            const key = item.key ?? `${epicKey}#${digest}`;
+            // AC / How / Why / Blocked-by / Owner ride along as separate fields — never
+            // part of the hashed text, so keys stay stable.
+            return {
+                text: item.text,
+                checked: item.checked,
+                key,
+                ...(item.dod && item.dod.length > 0 ? { dod: item.dod } : {}),
+                ...(item.howToImplement && item.howToImplement.length > 0
+                    ? { howToImplement: item.howToImplement }
+                    : {}),
+                ...(item.designContext && item.designContext.length > 0
+                    ? { designContext: item.designContext }
+                    : {}),
+                ...(item.blockedBy && item.blockedBy.length > 0 ? { blockedBy: item.blockedBy } : {}),
+                ...(item.owner ? { owner: item.owner } : {}),
+            };
+        });
+        return { heading: sub.heading, key: epicKey, items };
+    });
+}
+/**
+ * Order health of a keyed Targeted list. The list order IS the pushed (ClickUp) order, so:
+ *  - a `Blocked-by` edge whose target resolves to a ticket at-or-after the dependent is a
+ *    `blockedByViolation` (the pushed order contradicts the dependency);
+ *  - a `Blocked-by` token that looks intra-RC (starts with `${rcId}#`, OR contains no `#` at all —
+ *    a bare digest / epic letter) but matches no ticket key is `unresolvedBlockedBy` (typo / wrong
+ *    digest / stale). A token that DOES contain `#` with a different RC prefix is a legitimate
+ *    cross-RC/upstream dep and is ignored.
+ * `raw` (when provided, i.e. at export) is scanned for stray prose ordering sections — a divergent
+ * second order source. Pure + side-effect-free so both export and generate can call it.
+ */
+export function analyzeTaskoutOrder(sections, rcId, raw) {
+    const indexOf = new Map();
+    let flatIndex = 0;
+    for (const sub of sections) {
+        for (const item of sub.items) {
+            if (!indexOf.has(item.key))
+                indexOf.set(item.key, flatIndex);
+            flatIndex += 1;
+        }
+    }
+    const blockedByViolations = [];
+    const unresolvedBlockedBy = [];
+    for (const sub of sections) {
+        for (const item of sub.items) {
+            if (!item.blockedBy)
+                continue;
+            const depIndex = indexOf.get(item.key);
+            for (const token of item.blockedBy) {
+                if (indexOf.has(token)) {
+                    if (indexOf.get(token) >= depIndex) {
+                        blockedByViolations.push({ item: item.key, blocker: token });
+                    }
+                }
+                else if (token.startsWith(`${rcId}#`) || !token.includes("#")) {
+                    unresolvedBlockedBy.push({ item: item.key, token });
+                }
+                // else: cross-RC full key (has '#', different RC) — legitimate upstream dep, ignored.
+            }
+        }
+    }
+    const strayOrderingSections = [];
+    if (raw) {
+        const re = /^#{1,6}\s+(suggested|execution|implementation)\s+(order|sequence)\b.*$/gim;
+        let match;
+        while ((match = re.exec(raw)) !== null) {
+            strayOrderingSections.push({ heading: match[0].replace(/^#+\s+/, "").trim() });
+        }
+    }
+    // Phase-sequence: the human-readable `### Phase N` convention — the number IS the order, so a
+    // human reads ClickUp 1→2→3 as the work sequence. Silent unless the RC uses phase labels. Once
+    // ANY epic is phase-labeled, ALL must be (a `Phase 1` / `Unnumbered` / `Phase 2` mix defeats the
+    // convention); numbers must strictly ascend (gaps from a deferred phase are fine) starting at 0
+    // or 1 (Phase 0 = the de-risking pre-work idiom). A space after "Phase" is required.
+    const phaseSequenceViolations = [];
+    const phaseRe = /^Phase\s+(\d+)\b/i;
+    const phased = sections.map((s) => ({ heading: s.heading, n: phaseRe.exec(s.heading)?.[1] }));
+    const labeled = phased.filter((p) => p.n !== undefined);
+    if (labeled.length > 0) {
+        const unlabeled = phased.filter((p) => p.n === undefined);
+        if (unlabeled.length > 0) {
+            for (const u of unlabeled) {
+                phaseSequenceViolations.push({
+                    heading: u.heading,
+                    kind: "partial-adoption",
+                    detail: "is not labeled `Phase N` while sibling epics are — label all Targeted epics as phases, or none",
+                });
+            }
+        }
+        else {
+            let prev = Number.NEGATIVE_INFINITY;
+            labeled.forEach((p, i) => {
+                const num = Number(p.n);
+                if (i === 0 && num !== 0 && num !== 1) {
+                    phaseSequenceViolations.push({
+                        heading: p.heading,
+                        kind: "bad-start",
+                        detail: `first phase is ${num}; phases must start at 0 or 1`,
+                    });
+                }
+                if (num <= prev) {
+                    phaseSequenceViolations.push({
+                        heading: p.heading,
+                        kind: "out-of-order",
+                        detail: `phase ${num} does not exceed the preceding phase ${prev} — order epics so phase numbers strictly ascend`,
+                    });
+                }
+                prev = num;
+            });
+        }
+    }
+    return { blockedByViolations, unresolvedBlockedBy, strayOrderingSections, phaseSequenceViolations };
+}
 export async function exportTaskout(input) {
     validateRCId(input.rcId);
     const idMatch = input.rcId.match(/^(M|MRC)([0-9]+)_(.+)$/);
@@ -159,40 +337,11 @@ export async function exportTaskout(input) {
     if (!parsed) {
         throw new TaskoutError("rc-parse-failed", `Failed to parse ${rcAbs}.`);
     }
-    const slugCounts = new Map();
-    const targeted = parsed.targeted.map((sub) => {
-        const baseSlug = slugifyHeading(sub.heading);
-        const priorUses = slugCounts.get(baseSlug) ?? 0;
-        slugCounts.set(baseSlug, priorUses + 1);
-        const epicKey = priorUses === 0
-            ? `${input.rcId}#${baseSlug}`
-            : `${input.rcId}#${baseSlug}-${priorUses + 1}`;
-        const textOccurrences = new Map();
-        const items = sub.items.map((item) => {
-            const normalized = normalizeItemText(item.text);
-            const occurrence = textOccurrences.get(normalized) ?? 0;
-            textOccurrences.set(normalized, occurrence + 1);
-            // NUL delimiter prevents concatenation-shape collisions between text and occurrence.
-            const digest = createHash("sha1")
-                .update(`${normalized}\0${occurrence}`)
-                .digest("hex")
-                .slice(0, 12);
-            // AC / How / Why ride along as separate fields — never part of the hashed text, so keys stay stable.
-            return {
-                text: item.text,
-                checked: item.checked,
-                key: `${epicKey}#${digest}`,
-                ...(item.dod && item.dod.length > 0 ? { dod: item.dod } : {}),
-                ...(item.howToImplement && item.howToImplement.length > 0
-                    ? { howToImplement: item.howToImplement }
-                    : {}),
-                ...(item.designContext && item.designContext.length > 0
-                    ? { designContext: item.designContext }
-                    : {}),
-            };
-        });
-        return { heading: sub.heading, key: epicKey, items };
-    });
+    const targeted = keyedTargeted(parsed.targeted, input.rcId);
+    // Read path: surface order health as DATA, never throw — flay / clickup-sync / status depend on a
+    // clean export and classify stale refs downstream. The write-path gate (generateTaskout) is what
+    // refuses. `parsed.raw` feeds the stray-ordering-section lint.
+    const orderDiagnostics = analyzeTaskoutOrder(targeted, input.rcId, parsed.raw);
     return {
         rcId: input.rcId,
         path: rcAbs,
@@ -207,6 +356,7 @@ export async function exportTaskout(input) {
         blockersAndDeps: parsed.blockersAndDeps,
         definitionOfDone: parsed.definitionOfDone,
         references: parsed.references,
+        orderDiagnostics,
     };
 }
 function slugifyHeading(heading) {
@@ -220,10 +370,63 @@ function slugifyHeading(heading) {
 function normalizeItemText(text) {
     return text.normalize("NFKC").trim().replace(/\s+/g, " ");
 }
-async function enforceShippedTaskoutLock(rcAbs, plan) {
-    const existing = await parseRCFile(rcAbs);
-    if (!existing)
-        return;
+/**
+ * Re-attach persisted ticket keys to a maintenance plan that was rebuilt from a keyless LLM edit,
+ * so a ticket's identity survives a reword. Mutates plan items in place, filling `.key` where it is
+ * absent, in three safe-by-design layers (it never *guesses* a key onto the wrong ticket):
+ *   1. an item that already carries `.key` (the agent echoed it) is left as-is — authoritative;
+ *   2. else match the prior keyed item by exact normalized text, consuming duplicates 1:1 in
+ *      document order (handles reorder and an agent that dropped keys; robust to heading reweords);
+ *   3. else, within a heading-matched epic, if exactly ONE prior keyed item and ONE plan item
+ *      remain unmatched, pair them — the common single-ticket reword. Two-or-more leftovers on
+ *      either side are ambiguous, so it does NOT guess; those fall through to a fresh mint.
+ */
+function carryForwardKeys(existing, plan) {
+    const byText = new Map();
+    for (const sub of existing) {
+        for (const it of sub.items) {
+            if (!it.key)
+                continue;
+            const norm = normalizeItemText(it.text);
+            const queue = byText.get(norm) ?? [];
+            queue.push(it.key);
+            byText.set(norm, queue);
+        }
+    }
+    const consumed = new Set();
+    for (const sub of plan) {
+        for (const it of sub.items) {
+            if (it.key) {
+                consumed.add(it.key); // layer 1 — agent-echoed key wins
+                continue;
+            }
+            const queue = byText.get(normalizeItemText(it.text)); // layer 2 — exact text
+            if (queue && queue.length > 0) {
+                const key = queue.shift();
+                it.key = key;
+                consumed.add(key);
+            }
+        }
+    }
+    // layer 3 — unambiguous single-reword, scoped to a heading-matched epic.
+    const planByHeading = new Map();
+    for (const sub of plan) {
+        if (!planByHeading.has(sub.heading))
+            planByHeading.set(sub.heading, sub);
+    }
+    for (const exSub of existing) {
+        const planSub = planByHeading.get(exSub.heading);
+        if (!planSub)
+            continue;
+        const priorLeft = exSub.items.filter((it) => it.key && !consumed.has(it.key));
+        const planLeft = planSub.items.filter((it) => !it.key);
+        if (priorLeft.length === 1 && planLeft.length === 1) {
+            planLeft[0].key = priorLeft[0].key;
+            consumed.add(priorLeft[0].key);
+        }
+    }
+}
+async function enforceShippedTaskoutLock(existing, plan) {
     if (existing.status.toLowerCase() !== "shipped")
         return;
     const changed = [];
@@ -424,7 +627,7 @@ function buildTaskoutQuestions(rc, mode, techDebt, carried) {
     questions.push({
         id: "targeted",
         theme: "Targeted",
-        question: "Group the work into epics (one `### heading` per feature/area). Under each epic, list its tickets — one goal per ticket, sized so the ticket is independently deliverable and testable (INVEST). List tickets in execution order; that order is the priority. If a ticket is blocked by another, note it (here or under Blockers). A spike that de-risks an unknown is its own ticket. Cite concept-doc sections inline.",
+        question: "Group the work into epics (one `### heading` per feature/area). Under each epic, list its tickets — one goal per ticket, sized so the ticket is independently deliverable and testable (INVEST). List tickets in execution order, AND order the epics themselves top-to-bottom in execution order too — this Targeted list IS the order the human reads off ClickUp as the work sequence, so it must match the intended implementation order. Label the epics as sequential 1-indexed phases (`### Phase 1 — <name>`, `### Phase 2 — <name>`, …) so the number IS the order and ClickUp reads coherently 1→2→3; never out-of-sequence letter labels (`E0, A, C, B…`), which read as a jumble (descriptive headings are fine when an RC has no execution sequence). Do NOT author a separate 'Suggested Order' / 'Execution Order' section: it diverges silently and the tooling ignores it (the list is the only order that ships). If a ticket is blocked by another, note it (here or under Blockers). A spike that de-risks an unknown is its own ticket. Cite concept-doc sections inline.",
         rationale: "Agile-correct: epic = a feature, ticket = one INVEST-sized goal, backlog ordered by execution with dependencies explicit. Sub-task breakdowns live in Plan/ docs.",
     });
     questions.push({
@@ -444,8 +647,8 @@ function buildTaskoutQuestions(rc, mode, techDebt, carried) {
         id: "blockers",
         theme: "Blockers & Dependencies",
         question: techDebt.length || carried.length
-            ? "Confirm or edit the surfaced blockers (upstream RCs, scanned tech-debt items, carried-over items), then name any inter-ticket or external dependencies that constrain execution order."
-            : "Name the known dependencies that constrain execution order: upstream RCs, inter-ticket blockers within this RC, and external pending decisions (unratified ADRs, vendor calls).",
+            ? "Confirm or edit the surfaced blockers (upstream RCs, scanned tech-debt items, carried-over items), then name any inter-ticket or external dependencies that constrain execution order. Encode every intended ordering — including a soft 'do X before Y' with no hard code-dependency — as a `- Blocked-by:` edge on the dependent ticket so the order is machine-checked. Its value MUST be the dependency's full exported ticket key `<RCID>#<epic-slug>#<digest>`; a bare digest or epic letter is rejected at generate time."
+            : "Name the known dependencies that constrain execution order: upstream RCs, inter-ticket blockers within this RC, and external pending decisions (unratified ADRs, vendor calls). Encode every intended ordering — including a soft 'do X before Y' with no hard code-dependency — as a `- Blocked-by:` edge on the dependent ticket so the order is machine-checked. Its value MUST be the dependency's full exported ticket key `<RCID>#<epic-slug>#<digest>`; a bare digest or epic letter is rejected at generate time.",
         rationale: "Known dependencies up front make the ticket order a real execution plan, not a guess.",
     });
     questions.push({
@@ -497,10 +700,13 @@ function renderTaskout(plan, today) {
         lines.push("");
     }
     else {
-        for (const sub of plan.targeted) {
+        // Render from the keyed list so every ticket's immutable identity is persisted inline as a
+        // trailing `<!-- key: … -->` comment (minted here for any brand-new ticket). On the next read
+        // parseTargeted strips it back off the text, so this round-trips byte-identical.
+        for (const sub of keyedTargeted(plan.targeted, plan.rc.id)) {
             lines.push(`### ${sub.heading}`);
             for (const item of sub.items) {
-                lines.push(`- [${item.checked ? "x" : " "}] ${item.text}`);
+                lines.push(`- [${item.checked ? "x" : " "}] ${item.text}  <!-- key: ${item.key} -->`);
                 if (item.dod && item.dod.length > 0) {
                     for (const criterion of item.dod) {
                         lines.push(`  - AC: ${criterion}`);
@@ -515,6 +721,12 @@ function renderTaskout(plan, today) {
                     for (const note of item.designContext) {
                         lines.push(`  - Why: ${note}`);
                     }
+                }
+                if (item.blockedBy && item.blockedBy.length > 0) {
+                    lines.push(`  - Blocked-by: ${item.blockedBy.join(", ")}`);
+                }
+                if (item.owner) {
+                    lines.push(`  - Owner: ${item.owner}`);
                 }
             }
             lines.push("");
